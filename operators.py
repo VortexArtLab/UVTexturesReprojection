@@ -13,19 +13,22 @@ def _print_profile(profile, total):
         print(
             f"Map {w}x{h}: "
             f"Raster {timings['raster']:.3f}s | "
-            f"JFA {timings['jfa']:.3f}s ({timings['backend']})"
+            f"JFA {timings['jfa']:.3f}s ({timings['backend']}) | "
+            f"Upload {timings['map_upload']:.3f}s"
         )
         if timings.get("fallback_reason"):
-            print(f"GPU fallback: {timings['fallback_reason']}")
+            print(f"JFA fallback: {timings['fallback_reason']}")
 
     for name, timings in profile["images"]:
-        print(
-            f"{name}: "
-            f"Read {timings['read']:.3f}s | "
-            f"Sample {timings['sample']:.3f}s | "
-            f"Create {timings['create']:.3f}s | "
-            f"Write {timings['write']:.3f}s"
-        )
+        parts = [
+            f"{key.title()} {timings[key]:.3f}s"
+            for key in ("read", "sample", "readback", "create", "write")
+            if key in timings
+        ]
+        print(f"{name}: {' | '.join(parts)} ({timings['backend']})")
+
+        if timings.get("fallback_reason"):
+            print(f"GPU fallback: {timings['fallback_reason']}")
 
     print(f"Total: {total:.3f}s\n")
 

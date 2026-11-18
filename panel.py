@@ -48,7 +48,8 @@ class UTR_PT_material(bpy.types.Panel):
             "UTR_UL_textures", "",
             settings, "textures",
             settings, "active_texture_index",
-            rows=3,
+            rows=5,
+            maxrows=6,
         )
 
         actions = row.column(align=True)
