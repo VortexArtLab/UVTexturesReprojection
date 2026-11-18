@@ -10,25 +10,37 @@ def _print_profile(profile, total):
     print(f"Geometry: {profile['geometry']:.3f}s")
 
     for (w, h), timings in profile["maps"]:
+        jfa_label = "JFA submit" if timings.get("jfa_async") else "JFA"
+
         print(
             f"Map {w}x{h}: "
             f"Raster {timings['raster']:.3f}s | "
-            f"JFA {timings['jfa']:.3f}s ({timings['backend']}) | "
+            f"{jfa_label} {timings['jfa']:.3f}s "
+            f"({timings['backend']}) | "
             f"Upload {timings['map_upload']:.3f}s"
         )
-        if timings.get("fallback_reason"):
-            print(f"JFA fallback: {timings['fallback_reason']}")
 
     for name, timings in profile["images"]:
+        labels = {
+            "read": "Read",
+            "upload": "Upload",
+            "sample": "Dispatch",
+            "readback": "Readback/Sync",
+            "map_readback": "Map readback",
+            "create": "Create",
+            "write": "Write",
+        }
+
         parts = [
-            f"{key.title()} {timings[key]:.3f}s"
-            for key in ("read", "sample", "readback", "create", "write")
+            f"{labels[key]} {timings[key]:.3f}s"
+            for key in labels
             if key in timings
         ]
+
         print(f"{name}: {' | '.join(parts)} ({timings['backend']})")
 
         if timings.get("fallback_reason"):
-            print(f"GPU fallback: {timings['fallback_reason']}")
+            print(f"Fallback: {timings['fallback_reason']}")
 
     print(f"Total: {total:.3f}s\n")
 

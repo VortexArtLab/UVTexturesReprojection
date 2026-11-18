@@ -1,5 +1,6 @@
 
 import numpy as np
+import gpu
 
 
 _SHADER = None
@@ -171,7 +172,7 @@ def _get_shader(gpu):
     return _SHADER
 
 
-def _dispatch(gpu, shader, src, dst, width, height, step):
+def _dispatch(shader, src, dst, width, height, step):
     shader.bind()
     try:
         shader.storage_block("src", src)
@@ -179,6 +180,7 @@ def _dispatch(gpu, shader, src, dst, width, height, step):
         shader.uniform_int("width", width)
         shader.uniform_int("height", height)
         shader.uniform_int("step", step)
+
         gpu.compute.dispatch(
             shader,
             (width + 15) // 16,
@@ -209,14 +211,14 @@ def jump_flood(seed_map):
     step = 1 << max(0, (max(w, h) - 1).bit_length() - 1)
 
     while step:
-        _dispatch(gpu, shader, src, dst, w, h, step)
+        _dispatch(shader, src, dst, w, h, step)
         src, dst = dst, src
         step //= 2
 
-    _dispatch(gpu, shader, src, dst, w, h, 1)
+    _dispatch(shader, src, dst, w, h, 1)
     src, dst = dst, src
 
-    return np.frombuffer(bytes(src.read()), dtype=np.int32).reshape(h, w)
+    return src
 
 
 def create_sampling_maps(mapping):
@@ -228,24 +230,30 @@ def create_sampling_maps(mapping):
         mapping.source_coords, dtype=np.float32
     ).reshape(-1)
 
-    nearest = np.ascontiguousarray(
-        mapping.nearest_map, dtype=np.int32
-    ).reshape(-1)
-
     coords_buffer = gpu.types.Buffer(
         'FLOAT', (coords.size,), coords
     )
-    nearest_buffer = gpu.types.Buffer(
-        'INT', (nearest.size,), nearest
-    )
-
-    mapping.gpu_source_coords = gpu.types.GPUTexture(
+    source_coords = gpu.types.GPUTexture(
         (w, h), format='RG32F', data=coords_buffer
     )
-    mapping.gpu_nearest_map = gpu.types.GPUStorageBuf(
-        nearest_buffer
-    )
 
+    nearest_map = mapping.gpu_nearest_map
+
+    if nearest_map is None:
+        if mapping.nearest_map is None:
+            raise RuntimeError("Nearest map is unavailable")
+
+        nearest = np.ascontiguousarray(
+            mapping.nearest_map, dtype=np.int32
+        ).reshape(-1)
+
+        nearest_buffer = gpu.types.Buffer(
+            'INT', (nearest.size,), nearest
+        )
+        nearest_map = gpu.types.GPUStorageBuf(nearest_buffer)
+
+    mapping.gpu_source_coords = source_coords
+    mapping.gpu_nearest_map = nearest_map
 
 
 def reproject_image(image, mapping, settings):

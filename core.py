@@ -22,6 +22,30 @@ class ReprojectionMap:
         self.gpu_error = ""
 
 
+def ensure_cpu_nearest_map(mapping):
+    if mapping.nearest_map is not None:
+        return 0.0
+
+    if mapping.gpu_nearest_map is None:
+        raise ReprojectionError("Nearest map is unavailable")
+
+    start = perf_counter()
+
+    try:
+        data = mapping.gpu_nearest_map.read()
+        mapping.nearest_map = np.frombuffer(
+            bytes(data), dtype=np.int32
+        ).reshape(mapping.height, mapping.width).copy()
+        mapping.gpu_nearest_map = None
+
+    except Exception as exc:
+        raise ReprojectionError(
+            f"Cannot read GPU nearest map: {exc}"
+        ) from exc
+
+    return perf_counter() - start
+
+
 def collect_material_images(obj):
     images = []
     visited = set()
@@ -267,6 +291,8 @@ def build_reprojection_map(triangles, width, height, settings):
     if not np.any(seed_map >= 0):
         raise ReprojectionError("No pixels generated")
 
+    nearest_map = None
+    gpu_nearest_map = None
     gpu_errors = []
     backend = "CPU"
 
@@ -275,7 +301,7 @@ def build_reprojection_map(triangles, width, height, settings):
     if settings.compute_backend != 'CPU':
         try:
             from . import gpu_backend
-            nearest_map = gpu_backend.jump_flood(seed_map)
+            gpu_nearest_map = gpu_backend.jump_flood(seed_map)
             backend = "GPU"
         except Exception as exc:
             if settings.compute_backend == 'GPU':
@@ -288,8 +314,12 @@ def build_reprojection_map(triangles, width, height, settings):
         nearest_map = _jump_flood(seed_map)
 
     jfa_time = perf_counter() - start
+    jfa_async = gpu_nearest_map is not None
 
-    mapping = ReprojectionMap(width, height, source_coords, nearest_map)
+    mapping = ReprojectionMap(
+        width, height, source_coords, nearest_map
+    )
+    mapping.gpu_nearest_map = gpu_nearest_map
     map_upload_time = 0.0
 
     if settings.compute_backend != 'CPU':
@@ -297,9 +327,9 @@ def build_reprojection_map(triangles, width, height, settings):
         try:
             from . import gpu_backend
             gpu_backend.create_sampling_maps(mapping)
+
         except Exception as exc:
             mapping.gpu_source_coords = None
-            mapping.gpu_nearest_map = None
             gpu_errors.append(f"Map upload: {exc}")
 
             if settings.compute_backend == 'GPU':
@@ -314,6 +344,7 @@ def build_reprojection_map(triangles, width, height, settings):
     timings = {
         "raster": raster_time,
         "jfa": jfa_time,
+        "jfa_async": jfa_async,
         "backend": backend,
         "map_upload": map_upload_time,
     }
@@ -494,8 +525,9 @@ def _reproject_image_cpu(image, mapping, settings):
         raise ReprojectionError(f"Cannot process {image.name}: {exc}") from exc
 
 
-
 def reproject_image(image, mapping, settings):
+    map_readback = 0.0
+
     if settings.compute_backend != 'CPU':
         gpu_ready = (
             mapping.gpu_source_coords is not None
@@ -517,12 +549,9 @@ def reproject_image(image, mapping, settings):
                         f"GPU sampling failed: {exc}"
                     ) from exc
 
-                error = f"Sampling: {exc}"
-                mapping.gpu_error = "; ".join(
-                    filter(None, (mapping.gpu_error, error))
-                )
-                mapping.gpu_source_coords = None
-                mapping.gpu_nearest_map = None
+                mapping.gpu_error = "; ".join(filter(
+                    None, (mapping.gpu_error, f"Sampling: {exc}")
+                ))
 
         elif settings.compute_backend == 'GPU':
             raise ReprojectionError(
@@ -530,12 +559,20 @@ def reproject_image(image, mapping, settings):
                 f"{mapping.gpu_error or 'GPU maps missing'}"
             )
 
+        map_readback = ensure_cpu_nearest_map(mapping)
+        mapping.gpu_source_coords = None
+        mapping.gpu_nearest_map = None
+
     result, timings = _reproject_image_cpu(image, mapping, settings)
 
-    if settings.compute_backend == 'AUTO' and mapping.gpu_error:
-        timings["backend"] = "CPU fallback"
+    timings["map_readback"] = map_readback
+    timings["backend"] = (
+        "CPU fallback"
+        if settings.compute_backend == 'AUTO' and mapping.gpu_error
+        else "CPU"
+    )
+
+    if mapping.gpu_error and settings.compute_backend == 'AUTO':
         timings["fallback_reason"] = mapping.gpu_error
-    else:
-        timings["backend"] = "CPU"
 
     return result, timings
