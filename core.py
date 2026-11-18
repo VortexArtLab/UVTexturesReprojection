@@ -292,28 +292,47 @@ def build_uv_triangles(obj):
     settings = obj.utr_settings
 
     mesh.calc_loop_triangles()
+    triangle_count = len(mesh.loop_triangles)
 
-    source = mesh.uv_layers[settings.source_uv].data
-    destination = mesh.uv_layers[settings.destination_uv].data
-    triangles = []
-
-    for triangle in mesh.loop_triangles:
-        loops = triangle.loops
-        src = np.array([source[i].uv[:] for i in loops], dtype=np.float32)
-        dst = np.array([destination[i].uv[:] for i in loops], dtype=np.float32)
-
-        for uv in (src, dst):
-            if not np.all(np.isfinite(uv)):
-                raise ReprojectionError("UV coordinates contain invalid values")
-            if np.any(uv < -1e-6) or np.any(uv > 1.000001):
-                raise ReprojectionError("UV coordinates outside 0-1 are unsupported")
-
-        triangles.append((np.clip(src, 0.0, 1.0), np.clip(dst, 0.0, 1.0)))
-
-    if not triangles:
+    if not triangle_count:
         raise ReprojectionError("No triangles found")
 
-    return triangles
+    source_layer = mesh.uv_layers.get(settings.source_uv)
+    destination_layer = mesh.uv_layers.get(settings.destination_uv)
+
+    if source_layer is None or destination_layer is None:
+        raise ReprojectionError("Source or destination UV map not found")
+
+    loop_indices = np.empty(triangle_count * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("loops", loop_indices)
+    loop_indices = loop_indices.reshape(-1, 3)
+
+    loop_count = len(mesh.loops)
+    source_uv = np.empty(loop_count * 2, dtype=np.float32)
+    destination_uv = np.empty(loop_count * 2, dtype=np.float32)
+
+    source_layer.data.foreach_get("uv", source_uv)
+    destination_layer.data.foreach_get("uv", destination_uv)
+
+    source_uv = source_uv.reshape(-1, 2)
+    destination_uv = destination_uv.reshape(-1, 2)
+
+    source_triangles = np.ascontiguousarray(source_uv[loop_indices])
+    destination_triangles = np.ascontiguousarray(destination_uv[loop_indices])
+
+    for name, uv in (
+        ("Source", source_triangles),
+        ("Destination", destination_triangles),
+    ):
+        if not np.all(np.isfinite(uv)):
+            raise ReprojectionError(f"{name} UV coordinates contain invalid values")
+
+        if np.any(uv < -1e-6) or np.any(uv > 1.000001):
+            raise ReprojectionError(f"{name} UV coordinates outside 0-1 are unsupported")
+
+        np.clip(uv, 0.0, 1.0, out=uv)
+
+    return source_triangles, destination_triangles
 
 
 def _sample(pixels, x, y, mode):
@@ -511,9 +530,15 @@ def build_reprojection_map(triangles, width, height, settings):
         )
 
         start = perf_counter()
-        for src, dst in triangles:
+        source_triangles, destination_triangles = triangles
+
+        for index in range(len(source_triangles)):
             _rasterize_triangle(
-                source_coords, seed_map, src, dst, settings
+                source_coords,
+                seed_map,
+                source_triangles[index],
+                destination_triangles[index],
+                settings,
             )
         raster_time = perf_counter() - start
 

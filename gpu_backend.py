@@ -95,29 +95,37 @@ def rasterize(triangles, width, height, settings):
 
 
 def _build_tile_bins(triangles, width, height):
+    source_triangles, destination_triangles = triangles
+    triangle_count = len(source_triangles)
+
     tiles_x = (width + TILE_SIZE - 1) // TILE_SIZE
     tiles_y = (height + TILE_SIZE - 1) // TILE_SIZE
     bins = [[] for _ in range(tiles_x * tiles_y)]
 
-    tri_data = np.zeros((len(triangles), 12), dtype=np.float32)
-    scale = np.array((width, height), dtype=np.float32)
+    tri_data = np.empty((triangle_count, 12), dtype=np.float32)
+    tri_data[:, :6] = source_triangles.reshape(triangle_count, 6)
 
-    for index, (src, dst) in enumerate(triangles):
-        dst_px = dst * scale
-        tri_data[index, :6] = src.reshape(-1)
-        tri_data[index, 6:] = dst_px.reshape(-1)
+    destination_px = destination_triangles * np.array(
+        (width, height), dtype=np.float32
+    )
+    tri_data[:, 6:] = destination_px.reshape(triangle_count, 6)
+
+    for index in range(triangle_count):
+        dst = destination_px[index]
+        a, b, c = dst
 
         area = (
-            (dst_px[1, 0] - dst_px[0, 0]) * (dst_px[2, 1] - dst_px[0, 1]) -
-            (dst_px[1, 1] - dst_px[0, 1]) * (dst_px[2, 0] - dst_px[0, 0])
+            (b[0] - a[0]) * (c[1] - a[1]) -
+            (b[1] - a[1]) * (c[0] - a[0])
         )
+
         if abs(area) < 1e-10:
             continue
 
-        x0 = max(0, int(np.ceil(dst_px[:, 0].min() - 0.5)))
-        x1 = min(width - 1, int(np.floor(dst_px[:, 0].max() - 0.5)))
-        y0 = max(0, int(np.ceil(dst_px[:, 1].min() - 0.5)))
-        y1 = min(height - 1, int(np.floor(dst_px[:, 1].max() - 0.5)))
+        x0 = max(0, int(np.ceil(dst[:, 0].min() - 0.5)))
+        x1 = min(width - 1, int(np.floor(dst[:, 0].max() - 0.5)))
+        y0 = max(0, int(np.ceil(dst[:, 1].min() - 0.5)))
+        y1 = min(height - 1, int(np.floor(dst[:, 1].max() - 0.5)))
 
         if x0 > x1 or y0 > y1:
             continue
