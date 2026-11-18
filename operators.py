@@ -52,15 +52,26 @@ def _print_profile(profile, total):
     print(f"Geometry: {profile['geometry']:.3f}s")
 
     for (w, h), timings in profile["maps"]:
-        jfa_label = "JFA submit" if timings.get("jfa_async") else "JFA"
+        raster = timings["raster_details"]
+
+        if timings["raster_backend"] == "GPU":
+            raster_text = (
+                f"Binning {raster['binning']:.3f}s | "
+                f"Upload {raster['upload']:.3f}s | "
+                f"Dispatch {raster['dispatch']:.3f}s"
+            )
+        else:
+            raster_text = f"CPU {timings['raster']:.3f}s"
 
         print(
             f"Map {w}x{h}: "
-            f"Raster {timings['raster']:.3f}s | "
-            f"{jfa_label} {timings['jfa']:.3f}s "
-            f"({timings['backend']}) | "
-            f"Upload {timings['map_upload']:.3f}s"
+            f"Raster ({timings['raster_backend']}) {raster_text} | "
+            f"JFA {timings['jfa']:.3f}s ({timings['jfa_backend']}) | "
+            f"Map Upload {timings['map_upload']:.3f}s"
         )
+
+        if timings.get("fallback_reason"):
+            print(f"Fallback: {timings['fallback_reason']}")
 
     for name, timings in profile["images"]:
         labels = {

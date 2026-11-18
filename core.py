@@ -5,11 +5,22 @@ from time import perf_counter
 
 TILE_SIZE = 256
 
+
+class ReprojectionError(Exception):
+    pass
+
+
+class UVOverlapError(ReprojectionError):
+    pass
+
+
 class ReprojectionMap:
     __slots__ = (
         "width", "height",
         "source_coords", "nearest_map",
-        "gpu_source_coords", "gpu_nearest_map", "gpu_error",
+        "gpu_source_coords", "gpu_nearest_map",
+        "gpu_overlap_flag", "gpu_resources",
+        "gpu_error", "overlap_checked",
     )
 
     def __init__(self, width, height, source_coords, nearest_map):
@@ -19,29 +30,39 @@ class ReprojectionMap:
         self.nearest_map = nearest_map
         self.gpu_source_coords = None
         self.gpu_nearest_map = None
+        self.gpu_overlap_flag = None
+        self.gpu_resources = []
         self.gpu_error = ""
+        self.overlap_checked = False
 
 
-def ensure_cpu_nearest_map(mapping):
-    if mapping.nearest_map is not None:
-        return 0.0
-
-    if mapping.gpu_nearest_map is None:
-        raise ReprojectionError("Nearest map is unavailable")
-
+def ensure_cpu_mapping(mapping, settings):
     start = perf_counter()
 
-    try:
+    check_gpu_overlap(mapping, settings)
+
+    if mapping.source_coords is None:
+        if mapping.gpu_source_coords is None:
+            raise ReprojectionError("Source coordinates unavailable")
+
+        data = mapping.gpu_source_coords.read()
+        mapping.source_coords = np.frombuffer(
+            bytes(data), dtype=np.float32
+        ).reshape(mapping.height, mapping.width, 2).copy()
+
+    if mapping.nearest_map is None:
+        if mapping.gpu_nearest_map is None:
+            raise ReprojectionError("Nearest map unavailable")
+
         data = mapping.gpu_nearest_map.read()
         mapping.nearest_map = np.frombuffer(
             bytes(data), dtype=np.int32
         ).reshape(mapping.height, mapping.width).copy()
-        mapping.gpu_nearest_map = None
 
-    except Exception as exc:
-        raise ReprojectionError(
-            f"Cannot read GPU nearest map: {exc}"
-        ) from exc
+    mapping.gpu_source_coords = None
+    mapping.gpu_nearest_map = None
+    mapping.gpu_overlap_flag = None
+    mapping.gpu_resources.clear()
 
     return perf_counter() - start
 
@@ -223,8 +244,7 @@ def update_materials(obj, settings):
     return updated_nodes, missing
 
 
-class ReprojectionError(Exception):
-    pass
+
 
 
 def validate_settings(obj):
@@ -405,7 +425,7 @@ def _rasterize_triangle(source_coords, seed_map, src, dst, settings):
             seeds = seed_map[ty:ty1, tx:tx1]
 
             if settings.overlap_policy == 'ABORT' and np.any(inside & (seeds >= 0)):
-                raise ReprojectionError("Destination UV overlap detected")
+                raise UVOverlapError("Destination UV overlap detected")
 
             w0 = e1[inside] / area
             w1 = e2[inside] / area
@@ -421,77 +441,171 @@ def _rasterize_triangle(source_coords, seed_map, src, dst, settings):
             seeds[inside] = (yy[inside] * w + xx[inside])
 
 
+def check_gpu_overlap(mapping, settings):
+    if mapping.overlap_checked:
+        return
+
+    mapping.overlap_checked = True
+
+    if settings.overlap_policy != 'ABORT':
+        mapping.gpu_overlap_flag = None
+        return
+
+    flag_buffer = mapping.gpu_overlap_flag
+    if flag_buffer is None:
+        return
+
+    data = np.frombuffer(bytes(flag_buffer.read()), dtype=np.int32)
+    mapping.gpu_overlap_flag = None
+
+    if data[0]:
+        raise UVOverlapError("Destination UV overlap detected")
+
+
 def build_reprojection_map(triangles, width, height, settings):
+    from . import gpu_backend
+
     if width * height > np.iinfo(np.int32).max:
         raise ReprojectionError("Image resolution exceeds supported limits")
 
-    source_coords = np.zeros((height, width, 2), dtype=np.float32)
-    seed_map = np.full((height, width), -1, dtype=np.int32)
-
-    start = perf_counter()
-    for src, dst in triangles:
-        _rasterize_triangle(source_coords, seed_map, src, dst, settings)
-    raster_time = perf_counter() - start
-
-    if not np.any(seed_map >= 0):
-        raise ReprojectionError("No pixels generated")
-
-    nearest_map = None
-    gpu_nearest_map = None
+    gpu_source_coords = None
+    gpu_seed_map = None
+    gpu_overlap_flag = None
+    raster_resources = []
+    jfa_resources = []
     gpu_errors = []
-    backend = "CPU"
 
-    start = perf_counter()
+    raster_backend = "CPU"
+    raster_details = {}
 
     if settings.compute_backend != 'CPU':
         try:
-            from . import gpu_backend
-            gpu_nearest_map = gpu_backend.jump_flood(seed_map)
-            backend = "GPU"
+            (
+                gpu_source_coords,
+                gpu_seed_map,
+                gpu_overlap_flag,
+                raster_resources,
+                raster_details,
+            ) = gpu_backend.rasterize(
+                triangles, width, height, settings
+            )
+            raster_backend = "GPU"
+
+        except Exception as exc:
+            if settings.compute_backend == 'GPU':
+                raise ReprojectionError(
+                    f"GPU rasterization failed: {exc}"
+                ) from exc
+            gpu_errors.append(f"Rasterization: {exc}")
+
+    source_coords = None
+    seed_map = None
+    raster_time = 0.0
+
+    if gpu_source_coords is None:
+        source_coords = np.zeros(
+            (height, width, 2), dtype=np.float32
+        )
+        seed_map = np.full(
+            (height, width), -1, dtype=np.int32
+        )
+
+        start = perf_counter()
+        for src, dst in triangles:
+            _rasterize_triangle(
+                source_coords, seed_map, src, dst, settings
+            )
+        raster_time = perf_counter() - start
+
+        if not np.any(seed_map >= 0):
+            raise ReprojectionError("No pixels generated")
+
+        raster_details = {"cpu": raster_time}
+
+    jfa_backend = "CPU"
+    nearest_map = None
+    gpu_nearest_map = None
+
+    start = perf_counter()
+
+    if gpu_seed_map is not None:
+        try:
+            gpu_nearest_map, jfa_resources = gpu_backend.jump_flood(
+                gpu_seed_map, width, height, gpu_input=True
+            )
+            jfa_backend = "GPU"
+
+        except Exception as exc:
+            if settings.compute_backend == 'GPU':
+                raise ReprojectionError(f"GPU JFA failed: {exc}") from exc
+
+            seed_data = np.frombuffer(
+                bytes(gpu_seed_map.read()), dtype=np.int32
+            ).copy().reshape(height, width)
+
+            nearest_map = _jump_flood(seed_data)
+            gpu_nearest_map = None
+            raster_resources = ([gpu_overlap_flag] if gpu_overlap_flag is not None else [])
+            gpu_errors.append(f"JFA: {exc}")
+
+    elif settings.compute_backend != 'CPU':
+        try:
+            gpu_nearest_map, jfa_resources = gpu_backend.jump_flood(
+                seed_map, width, height
+            )
+            jfa_backend = "GPU"
+
         except Exception as exc:
             if settings.compute_backend == 'GPU':
                 raise ReprojectionError(f"GPU JFA failed: {exc}") from exc
 
             nearest_map = _jump_flood(seed_map)
-            backend = "CPU fallback"
             gpu_errors.append(f"JFA: {exc}")
+
     else:
         nearest_map = _jump_flood(seed_map)
 
     jfa_time = perf_counter() - start
-    jfa_async = gpu_nearest_map is not None
 
     mapping = ReprojectionMap(
         width, height, source_coords, nearest_map
     )
+
+    mapping.gpu_source_coords = gpu_source_coords
     mapping.gpu_nearest_map = gpu_nearest_map
-    map_upload_time = 0.0
+    mapping.gpu_overlap_flag = gpu_overlap_flag
+    mapping.gpu_resources = raster_resources + jfa_resources
 
     if settings.compute_backend != 'CPU':
         start = perf_counter()
+
         try:
-            from . import gpu_backend
             gpu_backend.create_sampling_maps(mapping)
 
         except Exception as exc:
-            mapping.gpu_source_coords = None
-            gpu_errors.append(f"Map upload: {exc}")
-
             if settings.compute_backend == 'GPU':
                 raise ReprojectionError(
                     f"GPU map upload failed: {exc}"
                 ) from exc
+            gpu_errors.append(f"Map upload: {exc}")
 
         map_upload_time = perf_counter() - start
+    else:
+        map_upload_time = 0.0
 
     mapping.gpu_error = "; ".join(gpu_errors)
 
+    raster_total = sum(raster_details.values())
+
     timings = {
-        "raster": raster_time,
+        "raster": raster_total,
+        "raster_backend": raster_backend,
+        "raster_details": raster_details,
         "jfa": jfa_time,
-        "jfa_async": jfa_async,
-        "backend": backend,
+        "jfa_backend": jfa_backend,
+        "jfa_async": jfa_backend == "GPU",
         "map_upload": map_upload_time,
+        "backend": jfa_backend,
     }
 
     if gpu_errors:
@@ -661,7 +775,7 @@ def _reproject_image_cpu(image, mapping, settings):
         except Exception:
             bpy.data.images.remove(result)
             raise
-        
+
         result["utr_source_image"] = image.name
         result["utr_output_suffix"] = settings.output_suffix
         return result, timings
@@ -690,6 +804,9 @@ def reproject_image(image, mapping, settings):
                 timings["backend"] = "GPU"
                 return result, timings
 
+            except UVOverlapError:
+                raise
+
             except Exception as exc:
                 if settings.compute_backend == 'GPU':
                     raise ReprojectionError(
@@ -706,20 +823,15 @@ def reproject_image(image, mapping, settings):
                 f"{mapping.gpu_error or 'GPU maps missing'}"
             )
 
-        map_readback = ensure_cpu_nearest_map(mapping)
-        mapping.gpu_source_coords = None
-        mapping.gpu_nearest_map = None
+        map_readback = ensure_cpu_mapping(mapping, settings)
 
     result, timings = _reproject_image_cpu(image, mapping, settings)
-
     timings["map_readback"] = map_readback
-    timings["backend"] = (
-        "CPU fallback"
-        if settings.compute_backend == 'AUTO' and mapping.gpu_error
-        else "CPU"
-    )
 
-    if mapping.gpu_error and settings.compute_backend == 'AUTO':
+    if settings.compute_backend == 'AUTO' and mapping.gpu_error:
+        timings["backend"] = "CPU fallback"
         timings["fallback_reason"] = mapping.gpu_error
+    else:
+        timings["backend"] = "CPU"
 
     return result, timings
