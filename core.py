@@ -78,6 +78,151 @@ def collect_material_images(obj):
     return images
 
 
+def iter_material_node_trees(obj):
+    visited = set()
+    stack = [
+        slot.material.node_tree
+        for slot in obj.material_slots
+        if slot.material and slot.material.use_nodes and slot.material.node_tree
+    ]
+
+    while stack:
+        tree = stack.pop()
+        pointer = tree.as_pointer()
+
+        if pointer in visited:
+            continue
+
+        visited.add(pointer)
+        yield tree
+
+        for node in tree.nodes:
+            if node.type == 'GROUP' and node.node_tree:
+                stack.append(node.node_tree)
+
+
+def find_reprojected_image(image, suffix):
+    matches = [
+        candidate for candidate in bpy.data.images
+        if candidate.get("utr_source_image") == image.name
+        and candidate.get("utr_output_suffix") == suffix
+    ]
+
+    if matches:
+        return matches[-1]
+
+    return bpy.data.images.get(f"{image.name}{suffix}")
+
+
+def update_materials(obj, settings):
+    uv_names = {uv.name for uv in obj.data.uv_layers}
+
+    if settings.destination_uv not in uv_names:
+        raise ReprojectionError("Invalid destination UV map")
+
+    replacements = {}
+    missing = []
+
+    for item in settings.textures:
+        source = item.image
+        if source is None:
+            continue
+
+        output = find_reprojected_image(source, settings.output_suffix)
+
+        if output is None:
+            missing.append(source.name)
+            continue
+
+        replacements[source.as_pointer()] = output
+        replacements[output.as_pointer()] = output
+
+    if not replacements:
+        return 0, missing
+
+    updated_nodes = 0
+
+    for tree in iter_material_node_trees(obj):
+        targets = []
+
+        for node in tree.nodes:
+            if node.type != 'TEX_IMAGE' or node.image is None:
+                continue
+
+            output = replacements.get(node.image.as_pointer())
+            if output is None:
+                continue
+
+            node.image = output
+            targets.append(node)
+
+        if not targets:
+            continue
+
+        target_sockets = {
+            node.inputs["Vector"].as_pointer()
+            for node in targets
+            if node.inputs.get("Vector") is not None
+        }
+
+        existing_uv = {}
+
+        for node in targets:
+            vector = node.inputs.get("Vector")
+            if vector is None:
+                continue
+
+            for link in vector.links:
+                source = link.from_node
+                if source.bl_idname == 'ShaderNodeUVMap':
+                    existing_uv[source.as_pointer()] = source
+
+        reusable_uv = []
+
+        for uv_node in existing_uv.values():
+            output = uv_node.outputs.get("UV")
+            if output is None:
+                continue
+
+            if all(
+                link.to_socket.as_pointer() in target_sockets
+                for link in output.links
+            ):
+                reusable_uv.append(uv_node)
+
+        if reusable_uv:
+            for uv_node in reusable_uv:
+                uv_node.uv_map = settings.destination_uv
+            shared_uv = reusable_uv[0]
+        else:
+            shared_uv = tree.nodes.new("ShaderNodeUVMap")
+            shared_uv.uv_map = settings.destination_uv
+            shared_uv.label = "Destination UV"
+
+            texture_x = min(node.location.x for node in targets)
+            texture_y = sum(node.location.y for node in targets) / len(targets)
+
+            shared_uv.location = (texture_x - 220, texture_y)
+            reusable_uv = [shared_uv]
+
+        for node in targets:
+            vector = node.inputs.get("Vector")
+            if vector is None:
+                continue
+
+            if any(link.from_node in reusable_uv for link in vector.links):
+                continue
+
+            for link in list(vector.links):
+                tree.links.remove(link)
+
+            tree.links.new(shared_uv.outputs["UV"], vector)
+
+        updated_nodes += len(targets)
+
+    return updated_nodes, missing
+
+
 class ReprojectionError(Exception):
     pass
 
@@ -516,7 +661,9 @@ def _reproject_image_cpu(image, mapping, settings):
         except Exception:
             bpy.data.images.remove(result)
             raise
-
+        
+        result["utr_source_image"] = image.name
+        result["utr_output_suffix"] = settings.output_suffix
         return result, timings
 
     except Exception as exc:

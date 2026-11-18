@@ -110,6 +110,46 @@ class UTR_OT_texture_get_from_materials(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UTR_OT_update_materials(bpy.types.Operator):
+    bl_idname = "utr.update_materials"
+    bl_label = "Update Materials"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.object and context.object.type == 'MESH')
+
+    def execute(self, context):
+        obj = context.object
+
+        try:
+            updated, missing = core.update_materials(
+                obj, obj.utr_settings
+            )
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        if not updated:
+            message = (
+                "No matching texture nodes found"
+                if not missing else
+                "No reprojected textures found"
+            )
+            self.report({'WARNING'}, message)
+            return {'CANCELLED'}
+
+        message = f"Updated {updated} texture nodes"
+
+        if missing:
+            message += f"; {len(missing)} output(s) missing"
+            self.report({'WARNING'}, message)
+        else:
+            self.report({'INFO'}, message)
+
+        return {'FINISHED'}
+
+
 class UTR_OT_texture_add(bpy.types.Operator):
     bl_idname = "utr.texture_add"
     bl_label = "Add Texture"
@@ -163,6 +203,16 @@ class UTR_OT_reproject(bpy.types.Operator):
             self.report({'ERROR'}, message)
             return {'CANCELLED'}
 
+        groups = {}
+        for item in settings.textures:
+            if item.image:
+                key = tuple(map(int, item.image.size))
+                groups.setdefault(key, []).append(item.image)
+
+        total_steps = 1 + len(groups) + len(settings.textures)
+        progress = 0
+        wm = context.window_manager
+
         total_start = perf_counter()
         profile = {
             "geometry": 0.0,
@@ -171,21 +221,24 @@ class UTR_OT_reproject(bpy.types.Operator):
         }
         outputs = []
 
+        wm.progress_begin(0, total_steps)
+
         try:
             start = perf_counter()
             triangles = core.build_uv_triangles(obj)
             profile["geometry"] = perf_counter() - start
 
-            groups = {}
-            for item in settings.textures:
-                key = tuple(map(int, item.image.size))
-                groups.setdefault(key, []).append(item.image)
+            progress += 1
+            wm.progress_update(progress)
 
             for (w, h), images in groups.items():
                 mapping, timings = core.build_reprojection_map(
                     triangles, w, h, settings
                 )
                 profile["maps"].append(((w, h), timings))
+
+                progress += 1
+                wm.progress_update(progress)
 
                 for image in images:
                     result, timings = core.reproject_image(
@@ -195,7 +248,8 @@ class UTR_OT_reproject(bpy.types.Operator):
                     outputs.append(result)
                     profile["images"].append((image.name, timings))
 
-                del mapping
+                    progress += 1
+                    wm.progress_update(progress)
 
         except Exception as exc:
             for output in outputs:
@@ -205,6 +259,9 @@ class UTR_OT_reproject(bpy.types.Operator):
             _print_profile(profile, total)
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
+
+        finally:
+            wm.progress_end()
 
         total = perf_counter() - total_start
         _print_profile(profile, total)
@@ -221,5 +278,6 @@ CLASSES = (
     UTR_OT_texture_remove,
     UTR_OT_texture_move,
     UTR_OT_texture_get_from_materials,
+    UTR_OT_update_materials,
     UTR_OT_reproject,
 )

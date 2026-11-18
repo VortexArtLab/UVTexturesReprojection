@@ -12,10 +12,17 @@ class UTR_MT_texture_options(bpy.types.Menu):
     bl_label = "Texture Options"
 
     def draw(self, context):
-        self.layout.operator(
+        layout = self.layout
+        layout.operator(
             "utr.texture_get_from_materials",
             text="Get from Materials",
             icon='IMAGE_DATA',
+        )
+        layout.separator()
+        layout.operator(
+            "utr.update_materials",
+            text="Update Materials",
+            icon='NODE_MATERIAL',
         )
 
 class UTR_PT_material(bpy.types.Panel):

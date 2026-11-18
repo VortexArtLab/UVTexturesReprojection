@@ -370,6 +370,8 @@ def reproject_image(image, mapping, settings):
             raise
 
         timings["backend"] = "GPU"
+        result["utr_source_image"] = image.name
+        result["utr_output_suffix"] = settings.output_suffix
         return result, timings
 
     except Exception as exc:
