@@ -100,6 +100,7 @@ class UTR_PT_material(bpy.types.Panel):
         layout.separator()
         row = layout.row()
         row.enabled = valid
+        row.operator_context = 'INVOKE_REGION_WIN'
         row.operator("utr.reproject", text="Reproject", icon='MOD_UVPROJECT')
 
 

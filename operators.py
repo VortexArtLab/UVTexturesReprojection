@@ -5,6 +5,48 @@ from bpy.props import EnumProperty, IntProperty
 from time import perf_counter
 
 
+_UTR_STATUS = {
+    "active": False,
+    "progress": 0.0,
+    "cancel": False,
+    "label": "Reprojecting...",
+}
+
+
+def _draw_utr_statusbar(header, context):
+    layout = header.layout
+
+    layout.template_input_status()
+    layout.separator_spacer()
+    layout.template_reports_banner()
+    layout.template_running_jobs()
+
+    if _UTR_STATUS["active"]:
+        row = layout.row(align=True)
+        row.label(text="", icon='RENDER_STILL')
+        row.label(text=_UTR_STATUS["label"])
+
+        progress = row.row()
+        progress.scale_x = 2.0
+        progress.progress(
+            factor=_UTR_STATUS["progress"],
+            text=f"{int(_UTR_STATUS['progress'] * 100)}%",
+            type='BAR',
+        )
+
+        row.operator_context = 'INVOKE_REGION_WIN'
+        row.operator(
+            "utr.cancel_reproject",
+            text="",
+            icon='PANEL_CLOSE',
+        )
+
+    layout.separator_spacer()
+    row = layout.row()
+    row.alignment = 'RIGHT'
+    layout.template_status_info()
+
+
 def _print_profile(profile, total):
     print("\n[UTR] Reprojection Profile")
     print(f"Geometry: {profile['geometry']:.3f}s")
@@ -184,6 +226,22 @@ class UTR_OT_texture_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UTR_OT_cancel_reproject(bpy.types.Operator):
+    bl_idname = "utr.cancel_reproject"
+    bl_label = "Cancel Reprojection"
+    bl_description = "Stop texture reprojection"
+
+    @classmethod
+    def poll(cls, context):
+        return _UTR_STATUS["active"] and not _UTR_STATUS["cancel"]
+
+    def execute(self, context):
+        _UTR_STATUS["cancel"] = True
+        _UTR_STATUS["label"] = "Canceling..."
+        context.workspace.status_text_set_internal(None)
+        return {'FINISHED'}
+
+
 class UTR_OT_reproject(bpy.types.Operator):
     bl_idname = "utr.reproject"
     bl_label = "Reproject"
@@ -192,9 +250,13 @@ class UTR_OT_reproject(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         obj = context.object
-        return bool(obj and obj.type == 'MESH' and obj.mode == 'OBJECT')
-    
-    def execute(self, context):
+        return bool(
+            obj and obj.type == 'MESH'
+            and obj.mode == 'OBJECT'
+            and not _UTR_STATUS["active"]
+        )
+
+    def invoke(self, context, event):
         obj = context.object
         settings = obj.utr_settings
 
@@ -205,72 +267,178 @@ class UTR_OT_reproject(bpy.types.Operator):
 
         groups = {}
         for item in settings.textures:
-            if item.image:
-                key = tuple(map(int, item.image.size))
-                groups.setdefault(key, []).append(item.image)
+            key = tuple(map(int, item.image.size))
+            groups.setdefault(key, []).append(item.image)
 
-        total_steps = 1 + len(groups) + len(settings.textures)
-        progress = 0
-        wm = context.window_manager
+        self._obj = obj
+        self._settings = settings
+        self._wm = context.window_manager
+        self._workspace = context.workspace
+        self._timer = None
+        self._cleaned = False
 
-        total_start = perf_counter()
-        profile = {
+        self._groups = list(groups.items())
+        self._group_index = 0
+        self._image_index = 0
+        self._images = None
+        self._mapping = None
+        self._triangles = None
+        self._phase = "GEOMETRY"
+
+        self._outputs = []
+        self._completed = 0
+        self._total_steps = 1 + len(self._groups) + len(settings.textures)
+        self._start_time = perf_counter()
+
+        self._profile = {
             "geometry": 0.0,
             "maps": [],
             "images": [],
         }
-        outputs = []
 
-        wm.progress_begin(0, total_steps)
+        _UTR_STATUS.update({
+            "active": True,
+            "progress": 0.0,
+            "cancel": False,
+            "label": "Reprojecting...",
+        })
+
+        self._workspace.status_text_set(_draw_utr_statusbar)
+        self._workspace.status_text_set_internal(None)
+
+        self._timer = self._wm.event_timer_add(
+            0.05, window=context.window
+        )
+        self._wm.modal_handler_add(self)
+
+        return {'RUNNING_MODAL'}
+
+    def _update_progress(self):
+        self._completed += 1
+        _UTR_STATUS["progress"] = min(
+            1.0, self._completed / self._total_steps
+        )
+        self._workspace.status_text_set_internal(None)
+
+    def _process_step(self):
+        if self._phase == "GEOMETRY":
+            start = perf_counter()
+            self._triangles = core.build_uv_triangles(self._obj)
+            self._profile["geometry"] = perf_counter() - start
+
+            self._phase = "MAP"
+            self._update_progress()
+            return False
+
+        if self._phase == "MAP":
+            if self._group_index >= len(self._groups):
+                return True
+
+            (w, h), self._images = self._groups[self._group_index]
+
+            mapping, timings = core.build_reprojection_map(
+                self._triangles, w, h, self._settings
+            )
+
+            self._profile["maps"].append(((w, h), timings))
+            self._mapping = mapping
+            self._image_index = 0
+            self._phase = "IMAGE"
+
+            self._update_progress()
+            return False
+
+        if self._phase == "IMAGE":
+            image = self._images[self._image_index]
+
+            result, timings = core.reproject_image(
+                image, self._mapping, self._settings
+            )
+
+            result.use_fake_user = True
+            self._outputs.append(result)
+            self._profile["images"].append((image.name, timings))
+
+            self._image_index += 1
+            self._update_progress()
+
+            if self._image_index >= len(self._images):
+                self._mapping = None
+                self._images = None
+                self._group_index += 1
+                self._phase = "MAP"
+
+            return self._completed >= self._total_steps
+
+        return False
+
+    def _cleanup(self):
+        if self._cleaned:
+            return
+
+        self._cleaned = True
+
+        if self._timer is not None:
+            self._wm.event_timer_remove(self._timer)
+            self._timer = None
 
         try:
-            start = perf_counter()
-            triangles = core.build_uv_triangles(obj)
-            profile["geometry"] = perf_counter() - start
+            self._workspace.status_text_set(None)
+        except ReferenceError:
+            pass
 
-            progress += 1
-            wm.progress_update(progress)
+        _UTR_STATUS.update({
+            "active": False,
+            "progress": 0.0,
+            "cancel": False,
+            "label": "Reprojecting...",
+        })
 
-            for (w, h), images in groups.items():
-                mapping, timings = core.build_reprojection_map(
-                    triangles, w, h, settings
-                )
-                profile["maps"].append(((w, h), timings))
+    def _finish(self, cancelled=False, error=None):
+        total = perf_counter() - self._start_time
+        self._cleanup()
 
-                progress += 1
-                wm.progress_update(progress)
+        if cancelled or error is not None:
+            for output in self._outputs:
+                if output.name in bpy.data.images:
+                    bpy.data.images.remove(output, do_unlink=True)
 
-                for image in images:
-                    result, timings = core.reproject_image(
-                        image, mapping, settings
-                    )
-                    result.use_fake_user = True
-                    outputs.append(result)
-                    profile["images"].append((image.name, timings))
+        _print_profile(self._profile, total)
 
-                    progress += 1
-                    wm.progress_update(progress)
-
-        except Exception as exc:
-            for output in outputs:
-                bpy.data.images.remove(output, do_unlink=True)
-
-            total = perf_counter() - total_start
-            _print_profile(profile, total)
-            self.report({'ERROR'}, str(exc))
+        if cancelled:
+            self.report({'WARNING'}, "Reprojection cancelled")
             return {'CANCELLED'}
 
-        finally:
-            wm.progress_end()
-
-        total = perf_counter() - total_start
-        _print_profile(profile, total)
+        if error is not None:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
 
         self.report(
             {'INFO'},
-            f"Created {len(outputs)} textures in {total:.2f}s"
+            f"Created {len(self._outputs)} textures in {total:.2f}s"
         )
         return {'FINISHED'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            return self._finish(cancelled=True)
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        if _UTR_STATUS["cancel"]:
+            return self._finish(cancelled=True)
+
+        try:
+            if self._process_step():
+                return self._finish()
+        except Exception as exc:
+            return self._finish(error=exc)
+
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        self._cleanup()
 
 
 CLASSES = (
@@ -279,5 +447,6 @@ CLASSES = (
     UTR_OT_texture_move,
     UTR_OT_texture_get_from_materials,
     UTR_OT_update_materials,
+    UTR_OT_cancel_reproject,
     UTR_OT_reproject,
 )
