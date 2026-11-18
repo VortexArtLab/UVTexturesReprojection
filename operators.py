@@ -2,6 +2,30 @@
 import bpy
 from . import core
 from bpy.props import EnumProperty, IntProperty
+from time import perf_counter
+
+
+def _print_profile(profile, total):
+    print("\n[UTR] Reprojection Profile")
+    print(f"Geometry: {profile['geometry']:.3f}s")
+
+    for (w, h), timings in profile["maps"]:
+        print(
+            f"Map {w}x{h}: "
+            f"Raster {timings['raster']:.3f}s | "
+            f"JFA {timings['jfa']:.3f}s"
+        )
+
+    for name, timings in profile["images"]:
+        print(
+            f"{name}: "
+            f"Read {timings['read']:.3f}s | "
+            f"Sample {timings['sample']:.3f}s | "
+            f"Create {timings['create']:.3f}s | "
+            f"Write {timings['write']:.3f}s"
+        )
+
+    print(f"Total: {total:.3f}s\n")
 
 
 class UTR_OT_texture_move(bpy.types.Operator):
@@ -112,7 +136,7 @@ class UTR_OT_reproject(bpy.types.Operator):
     def poll(cls, context):
         obj = context.object
         return bool(obj and obj.type == 'MESH' and obj.mode == 'OBJECT')
-
+    
     def execute(self, context):
         obj = context.object
         settings = obj.utr_settings
@@ -122,24 +146,56 @@ class UTR_OT_reproject(bpy.types.Operator):
             self.report({'ERROR'}, message)
             return {'CANCELLED'}
 
+        total_start = perf_counter()
+        profile = {
+            "geometry": 0.0,
+            "maps": [],
+            "images": [],
+        }
         outputs = []
 
         try:
+            start = perf_counter()
             triangles = core.build_uv_triangles(obj)
+            profile["geometry"] = perf_counter() - start
 
+            groups = {}
             for item in settings.textures:
-                output = core.reproject_image(item.image, triangles, settings)
-                output.use_fake_user = True
-                outputs.append(output)
+                key = tuple(map(int, item.image.size))
+                groups.setdefault(key, []).append(item.image)
+
+            for (w, h), images in groups.items():
+                mapping, timings = core.build_reprojection_map(
+                    triangles, w, h, settings
+                )
+                profile["maps"].append(((w, h), timings))
+
+                for image in images:
+                    result, timings = core.reproject_image(
+                        image, mapping, settings
+                    )
+                    result.use_fake_user = True
+                    outputs.append(result)
+                    profile["images"].append((image.name, timings))
+
+                del mapping
 
         except Exception as exc:
             for output in outputs:
                 bpy.data.images.remove(output, do_unlink=True)
 
+            total = perf_counter() - total_start
+            _print_profile(profile, total)
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Created {len(outputs)} texture(s)")
+        total = perf_counter() - total_start
+        _print_profile(profile, total)
+
+        self.report(
+            {'INFO'},
+            f"Created {len(outputs)} textures in {total:.2f}s"
+        )
         return {'FINISHED'}
 
 

@@ -1,8 +1,19 @@
 
 import bpy
 import numpy as np
+from time import perf_counter
 
 TILE_SIZE = 256
+
+class ReprojectionMap:
+    __slots__ = ("width", "height", "source_coords", "nearest_map")
+
+    def __init__(self, width, height, source_coords, nearest_map):
+        self.width = width
+        self.height = height
+        self.source_coords = source_coords
+        self.nearest_map = nearest_map
+
 
 def collect_material_images(obj):
     images = []
@@ -161,16 +172,14 @@ def _top_left(a, b):
     return dy > 0.0 or (abs(dy) < 1e-12 and dx < 0.0)
 
 
-
-def _rasterize_triangle(source_pixels, output, seed_map, src, dst, settings):
-    h, w = output.shape[:2]
+def _rasterize_triangle(source_coords, seed_map, src, dst, settings):
+    h, w = seed_map.shape
     dst = dst * np.array((w, h), dtype=np.float32)
 
     area = (
         (dst[1, 0] - dst[0, 0]) * (dst[2, 1] - dst[0, 1]) -
         (dst[1, 1] - dst[0, 1]) * (dst[2, 0] - dst[0, 0])
     )
-
     if abs(area) < 1e-10:
         return
 
@@ -232,19 +241,33 @@ def _rasterize_triangle(source_pixels, output, seed_map, src, dst, settings):
                 w2[:, None] * src[2]
             )
 
-            ix = xx[inside]
-            iy = yy[inside]
+            source_coords[ty:ty1, tx:tx1][inside] = uv
+            seeds[inside] = (yy[inside] * w + xx[inside])
 
-            sampled = _sample(
-                source_pixels,
-                uv[:, 0] * w - 0.5,
-                uv[:, 1] * h - 0.5,
-                settings.interpolation,
-            )
 
-            output[ty:ty1, tx:tx1][inside] = sampled
-            seeds[inside] = (iy.astype(np.int64) * w + ix).astype(np.int32)
+def build_reprojection_map(triangles, width, height, settings):
+    if width * height > np.iinfo(np.int32).max:
+        raise ReprojectionError("Image resolution exceeds supported limits")
 
+    source_coords = np.zeros((height, width, 2), dtype=np.float32)
+    seed_map = np.full((height, width), -1, dtype=np.int32)
+
+    start = perf_counter()
+    for src, dst in triangles:
+        _rasterize_triangle(source_coords, seed_map, src, dst, settings)
+    raster_time = perf_counter() - start
+
+    if not np.any(seed_map >= 0):
+        raise ReprojectionError("No pixels generated")
+
+    start = perf_counter()
+    nearest_map = _jump_flood(seed_map)
+    jfa_time = perf_counter() - start
+
+    return ReprojectionMap(width, height, source_coords, nearest_map), {
+        "raster": raster_time,
+        "jfa": jfa_time,
+    }
 
 
 def _jump_flood_pass(current, target, w, h, step):
@@ -332,90 +355,86 @@ def _jump_flood(seed_map):
     return current
 
 
-def _dilate_pixels(pixels, seed_map, settings):
-    h, w = seed_map.shape
+def reproject_image(image, mapping, settings):
+    timings = {}
+    w, h = mapping.width, mapping.height
 
-    if settings.dilation_mode == 'FIXED' and settings.padding <= 0:
-        return
+    if tuple(image.size) != (w, h):
+        raise ReprojectionError(f"Resolution mismatch: {image.name}")
 
-    nearest = _jump_flood(seed_map)
-    flat = pixels.reshape(-1, 4)
-    radius_sq = settings.padding ** 2
-
-    for y0 in range(0, h, TILE_SIZE):
-        y1 = min(y0 + TILE_SIZE, h)
-
-        for x0 in range(0, w, TILE_SIZE):
-            x1 = min(x0 + TILE_SIZE, w)
-
-            ids = nearest[y0:y1, x0:x1]
-
-            ys = np.arange(y0, y1, dtype=np.int64)[:, None]
-            xs = np.arange(x0, x1, dtype=np.int64)[None, :]
-            own = ys * w + xs
-
-            valid = (ids >= 0) & (ids != own)
-
-            if settings.dilation_mode == 'FIXED':
-                sx = np.where(ids >= 0, ids % w, 0).astype(np.int64)
-                sy = np.where(ids >= 0, ids // w, 0).astype(np.int64)
-
-                dx = sx - xs
-                dy = sy - ys
-
-                valid &= dx * dx + dy * dy <= radius_sq
-
-            if np.any(valid):
-                tile = pixels[y0:y1, x0:x1]
-                tile[valid] = flat[ids[valid]]
-
-
-def reproject_image(image, triangles, settings):
     try:
+        start = perf_counter()
         if image.source == 'FILE' and not image.has_data:
             image.reload()
 
-        w, h = map(int, image.size)
-        if w * h > np.iinfo(np.int32).max:
-            raise ReprojectionError("Image resolution exceeds supported limits")
-
         source_pixels = np.empty((h, w, 4), dtype=np.float32)
         image.pixels.foreach_get(source_pixels.ravel())
+        timings["read"] = perf_counter() - start
+
+        start = perf_counter()
+        output = np.zeros((h, w, 4), dtype=np.float32)
+        source_flat = mapping.source_coords.reshape(-1, 2)
+        radius_sq = settings.padding ** 2
+
+        for y0 in range(0, h, TILE_SIZE):
+            y1 = min(y0 + TILE_SIZE, h)
+
+            for x0 in range(0, w, TILE_SIZE):
+                x1 = min(x0 + TILE_SIZE, w)
+                ids = mapping.nearest_map[y0:y1, x0:x1]
+                valid = ids >= 0
+
+                if settings.dilation_mode == 'FIXED':
+                    safe_ids = np.maximum(ids, 0)
+                    ys = np.arange(y0, y1, dtype=np.int64)[:, None]
+                    xs = np.arange(x0, x1, dtype=np.int64)[None, :]
+                    dx = safe_ids % w - xs
+                    dy = safe_ids // w - ys
+                    valid &= (dx * dx + dy * dy) <= radius_sq
+
+                if not np.any(valid):
+                    continue
+
+                coords = source_flat[ids[valid]]
+                sampled = _sample(
+                    source_pixels,
+                    coords[:, 0] * w - 0.5,
+                    coords[:, 1] * h - 0.5,
+                    settings.interpolation,
+                )
+                output[y0:y1, x0:x1][valid] = sampled
+
+        timings["sample"] = perf_counter() - start
+
+        start = perf_counter()
+        result = bpy.data.images.new(
+            name=f"{image.name}{settings.output_suffix}",
+            width=w,
+            height=h,
+            alpha=True,
+            float_buffer=image.is_float,
+            is_data=image.colorspace_settings.is_data,
+        )
+        timings["create"] = perf_counter() - start
+
+        try:
+            result.colorspace_settings.name = image.colorspace_settings.name
+            result.alpha_mode = image.alpha_mode
+            result.display_aspect = image.display_aspect
+            result.file_format = image.file_format
+
+            start = perf_counter()
+            result.pixels.foreach_set(output.ravel())
+            result.update()
+            timings["write"] = perf_counter() - start
+
+        except Exception:
+            bpy.data.images.remove(result)
+            raise
+
+        return result, timings
 
     except Exception as exc:
-        raise ReprojectionError(f"Cannot read {image.name}: {exc}") from exc
-
-    output = np.zeros((h, w, 4), dtype=np.float32)
-    seed_map = np.full((h, w), -1, dtype=np.int32)
-
-    for src, dst in triangles:
-        _rasterize_triangle(
-            source_pixels, output, seed_map, src, dst, settings
-        )
-
-    if seed_map.max() < 0:
-        raise ReprojectionError(f"No pixels generated for {image.name}")
-
-    _dilate_pixels(output, seed_map, settings)
-
-    result = bpy.data.images.new(
-        name=f"{image.name}{settings.output_suffix}",
-        width=w,
-        height=h,
-        alpha=True,
-        float_buffer=image.is_float,
-        is_data=image.colorspace_settings.is_data,
-    )
-
-    try:
-        result.colorspace_settings.name = image.colorspace_settings.name
-        result.alpha_mode = image.alpha_mode
-        result.display_aspect = image.display_aspect
-        result.file_format = image.file_format
-        result.pixels.foreach_set(output.ravel())
-        result.update()
-    except Exception:
-        bpy.data.images.remove(result)
-        raise
-
-    return result
+        if isinstance(exc, ReprojectionError):
+            raise
+        raise ReprojectionError(f"Cannot process {image.name}: {exc}") from exc
