@@ -261,13 +261,37 @@ def build_reprojection_map(triangles, width, height, settings):
         raise ReprojectionError("No pixels generated")
 
     start = perf_counter()
-    nearest_map = _jump_flood(seed_map)
+    backend = "CPU"
+    fallback_reason = ""
+
+    if settings.compute_backend != 'CPU':
+        try:
+            from . import gpu_backend
+            nearest_map = gpu_backend.jump_flood(seed_map)
+            backend = "GPU"
+
+        except Exception as exc:
+            if settings.compute_backend == 'GPU':
+                raise ReprojectionError(f"GPU JFA failed: {exc}") from exc
+
+            nearest_map = _jump_flood(seed_map)
+            backend = "CPU fallback"
+            fallback_reason = str(exc)
+    else:
+        nearest_map = _jump_flood(seed_map)
+
     jfa_time = perf_counter() - start
 
-    return ReprojectionMap(width, height, source_coords, nearest_map), {
+    timings = {
         "raster": raster_time,
         "jfa": jfa_time,
+        "backend": backend,
     }
+
+    if fallback_reason:
+        timings["fallback_reason"] = fallback_reason
+
+    return ReprojectionMap(width, height, source_coords, nearest_map), timings
 
 
 def _jump_flood_pass(current, target, w, h, step):

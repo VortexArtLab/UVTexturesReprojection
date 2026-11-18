@@ -20,6 +20,16 @@ class UTR_PG_Settings(bpy.types.PropertyGroup):
     textures: CollectionProperty(type=UTR_PG_Texture)
     active_texture_index: IntProperty(default=0, min=0)
 
+    compute_backend: EnumProperty(
+        name="Compute Backend",
+        items=[
+            ('AUTO', "Auto", "Use GPU with CPU fallback"),
+            ('CPU', "CPU", "Use CPU implementation"),
+            ('GPU', "GPU", "Require GPU compute"),
+        ],
+        default='AUTO',
+    )
+
     interpolation: EnumProperty(
         name="Interpolation",
         items=[

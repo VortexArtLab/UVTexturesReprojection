@@ -13,8 +13,10 @@ def _print_profile(profile, total):
         print(
             f"Map {w}x{h}: "
             f"Raster {timings['raster']:.3f}s | "
-            f"JFA {timings['jfa']:.3f}s"
+            f"JFA {timings['jfa']:.3f}s ({timings['backend']})"
         )
+        if timings.get("fallback_reason"):
+            print(f"GPU fallback: {timings['fallback_reason']}")
 
     for name, timings in profile["images"]:
         print(

@@ -76,6 +76,7 @@ class UTR_PT_material(bpy.types.Panel):
         layout.separator()
         layout.label(text="Processing")
         layout.prop(settings, "interpolation")
+        layout.prop(settings, "compute_backend")
         layout.prop(settings, "dilation_mode")
 
         if settings.dilation_mode == 'FIXED':
