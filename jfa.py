@@ -9,19 +9,20 @@ def _jump_flood_pass(
     width,
     height,
     step,
+    tile_size,
     x_coords,
     y_coords,
     workspace,
 ):
     work_x, work_y, best_dist, candidate_dist, valid, update = workspace
 
-    for y0 in range(0, height, TILE_SIZE):
-        y1 = min(y0 + TILE_SIZE, height)
+    for y0 in range(0, height, tile_size):
+        y1 = min(y0 + tile_size, height)
         tile_height = y1 - y0
         ys = y_coords[y0:y1, None]
 
-        for x0 in range(0, width, TILE_SIZE):
-            x1 = min(x0 + TILE_SIZE, width)
+        for x0 in range(0, width, tile_size):
+            x1 = min(x0 + tile_size, width)
             tile_width = x1 - x0
             xs = x_coords[None, x0:x1]
 
@@ -115,7 +116,9 @@ def _jump_flood_pass(
                     np.copyto(dist_sub, dist, where=update_mask)
 
 
-def jump_flood(seed_map):
+def jump_flood(seed_map, tile_size=TILE_SIZE):
+    if tile_size < 1:
+        raise ValueError("Tile size must be positive")
     height, width = seed_map.shape
 
     if seed_map.dtype.kind != "i":
@@ -136,8 +139,8 @@ def jump_flood(seed_map):
     y_coords = np.arange(height, dtype=dtype)
 
     workspace_shape = (
-        min(TILE_SIZE, height),
-        min(TILE_SIZE, width),
+        min(tile_size, height),
+        min(tile_size, width),
     )
 
     workspace = tuple(
@@ -160,6 +163,7 @@ def jump_flood(seed_map):
             width,
             height,
             step,
+            tile_size,
             x_coords,
             y_coords,
             workspace,
@@ -173,6 +177,7 @@ def jump_flood(seed_map):
         width,
         height,
         1,
+        tile_size,
         x_coords,
         y_coords,
         workspace,
