@@ -27,6 +27,7 @@ class ReprojectionMap:
         "gpu_source_coords", "gpu_nearest_map",
         "gpu_tangent_map", "gpu_overlap_flag",
         "gpu_resources", "gpu_error", "overlap_checked",
+        "sampling_plan",
     )
 
     def __init__(
@@ -46,3 +47,4 @@ class ReprojectionMap:
         self.gpu_resources = []
         self.gpu_error = ""
         self.overlap_checked = False
+        self.sampling_plan = None

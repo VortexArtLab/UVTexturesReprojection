@@ -4,6 +4,9 @@ from time import perf_counter
 from .constants import TILE_SIZE
 from .models import ReprojectionError
 
+MAX_SAMPLING_PLAN_BYTES = 1792 * 1024 * 1024
+MAX_SAMPLING_PLAN_MAX_DIMENSION = 8192
+
 
 def _sample(pixels, x, y, mode):
     h, w = pixels.shape[:2]
@@ -51,6 +54,101 @@ def _sample(pixels, x, y, mode):
     return result
 
 
+def _build_sampling_plan(mapping, settings):
+    w, h = mapping.width, mapping.height
+    if max(w, h) >= 16384:
+        return None
+    index_dtype = np.dtype(
+        np.uint16 if max(w, h) <= 65536 else np.uint32
+    )
+    tile_specs = []
+    valid_count = 0
+    radius_sq = settings.padding ** 2
+
+    for y0 in range(0, h, TILE_SIZE):
+        y1 = min(y0 + TILE_SIZE, h)
+        for x0 in range(0, w, TILE_SIZE):
+            x1 = min(x0 + TILE_SIZE, w)
+            ids = mapping.nearest_map[y0:y1, x0:x1]
+            valid = ids >= 0
+
+            if settings.dilation_mode == 'FIXED':
+                safe_ids = np.maximum(ids, 0)
+                ys = np.arange(y0, y1, dtype=np.int64)[:, None]
+                xs = np.arange(x0, x1, dtype=np.int64)[None, :]
+                dx = safe_ids % w - xs
+                dy = safe_ids // w - ys
+                valid &= (dx * dx + dy * dy) <= radius_sq
+
+            count = int(np.count_nonzero(valid))
+            valid_count += count
+
+            weight_dtype = np.dtype(
+                np.result_type(mapping.source_coords.dtype, np.int32)
+            )
+
+            plan_bytes = w * h + valid_count * (
+                4 * index_dtype.itemsize
+                + 2 * weight_dtype.itemsize
+            )
+
+            if plan_bytes > MAX_SAMPLING_PLAN_BYTES:
+                return None
+
+            tile_specs.append((y0, y1, x0, x1, valid, count))
+
+    source_flat = mapping.source_coords.reshape(-1, 2)
+    tiles = []
+
+    for y0, y1, x0, x1, valid, count in tile_specs:
+        if count:
+            ids = mapping.nearest_map[y0:y1, x0:x1]
+            coords = source_flat[ids[valid]]
+
+            sx = coords[:, 0] * w - 0.5
+            sy = coords[:, 1] * h - 0.5
+            ix = np.floor(sx).astype(np.int32)
+            iy = np.floor(sy).astype(np.int32)
+            fx = sx - ix
+            fy = sy - iy
+
+            sample_x0 = np.clip(ix, 0, w - 1).astype(index_dtype)
+            sample_x1 = np.clip(ix + 1, 0, w - 1).astype(index_dtype)
+            sample_y0 = np.clip(iy, 0, h - 1).astype(index_dtype)
+            sample_y1 = np.clip(iy + 1, 0, h - 1).astype(index_dtype)
+
+        else:
+            sample_x0 = np.empty(0, dtype=index_dtype)
+            sample_x1 = np.empty(0, dtype=index_dtype)
+            sample_y0 = np.empty(0, dtype=index_dtype)
+            sample_y1 = np.empty(0, dtype=index_dtype)
+            fx = np.empty(0, dtype=np.float32)
+            fy = np.empty(0, dtype=np.float32)
+
+        tiles.append((
+            y0, y1, x0, x1,
+            valid,
+            sample_x0, sample_x1,
+            sample_y0, sample_y1,
+            fx, fy, count,
+        ))
+
+    return {"tiles": tiles, "bytes": plan_bytes}
+
+
+def _sample_linear_plan(pixels, x0, x1, y0, y1, fx, fy):
+    a = (
+        pixels[y0, x0] * (1.0 - fx[:, None])
+        + pixels[y0, x1] * fx[:, None]
+    )
+    b = (
+        pixels[y1, x0] * (1.0 - fx[:, None])
+        + pixels[y1, x1] * fx[:, None]
+    )
+    return a * (1.0 - fy[:, None]) + b * fy[:, None]
+
+
+
 def _reproject_image_cpu(image, mapping, settings):
     timings = {}
     w, h = mapping.width, mapping.height
@@ -68,6 +166,26 @@ def _reproject_image_cpu(image, mapping, settings):
         raise ReprojectionError(f"Resolution mismatch: {image.name}")
 
     try:
+        plan_build_time = 0.0
+        plan = None
+        plan_status = "not_applicable"
+
+        if settings.interpolation == 'LINEAR':
+            if mapping.sampling_plan is None:
+                start = perf_counter()
+                mapping.sampling_plan = _build_sampling_plan(
+                    mapping, settings
+                )
+                if mapping.sampling_plan is None:
+                    mapping.sampling_plan = False
+                plan_build_time = perf_counter() - start
+
+            if mapping.sampling_plan is False:
+                plan_status = "memory_limit"
+            else:
+                plan = mapping.sampling_plan
+                plan_status = "cached"
+
         start = perf_counter()
         if image.source == 'FILE' and not image.has_data:
             image.reload()
@@ -78,13 +196,17 @@ def _reproject_image_cpu(image, mapping, settings):
 
         start = perf_counter()
         output = np.zeros((h, w, 4), dtype=np.float32)
-        source_flat = mapping.source_coords.reshape(-1, 2)
+        source_flat = (
+            None if plan is not None
+            else mapping.source_coords.reshape(-1, 2)
+        )
         tangent_flat = (
             mapping.tangent_map.reshape(-1, 4)
             if tangent_normal else None
         )
         normal_transform_time = 0.0
         radius_sq = settings.padding ** 2
+        plan_iter = iter(plan["tiles"]) if plan is not None else None
 
         for y0 in range(0, h, TILE_SIZE):
             y1 = min(y0 + TILE_SIZE, h)
@@ -92,26 +214,50 @@ def _reproject_image_cpu(image, mapping, settings):
             for x0 in range(0, w, TILE_SIZE):
                 x1 = min(x0 + TILE_SIZE, w)
                 ids = mapping.nearest_map[y0:y1, x0:x1]
-                valid = ids >= 0
 
-                if settings.dilation_mode == 'FIXED':
-                    safe_ids = np.maximum(ids, 0)
-                    ys = np.arange(y0, y1, dtype=np.int64)[:, None]
-                    xs = np.arange(x0, x1, dtype=np.int64)[None, :]
-                    dx = safe_ids % w - xs
-                    dy = safe_ids // w - ys
-                    valid &= (dx * dx + dy * dy) <= radius_sq
+                if plan_iter is not None:
+                    (
+                        _, _, _, _, valid,
+                        sample_x0, sample_x1,
+                        sample_y0, sample_y1,
+                        fx, fy, count,
+                    ) = next(plan_iter)
 
-                if not np.any(valid):
-                    continue
+                    if count == 0:
+                        continue
 
-                coords = source_flat[ids[valid]]
-                sampled = _sample(
-                    source_pixels,
-                    coords[:, 0] * w - 0.5,
-                    coords[:, 1] * h - 0.5,
-                    settings.interpolation,
-                ).copy()
+                else:
+                    valid = ids >= 0
+
+                    if settings.dilation_mode == 'FIXED':
+                        safe_ids = np.maximum(ids, 0)
+                        ys = np.arange(y0, y1, dtype=np.int64)[:, None]
+                        xs = np.arange(x0, x1, dtype=np.int64)[None, :]
+                        dx = safe_ids % w - xs
+                        dy = safe_ids // w - ys
+                        valid &= (dx * dx + dy * dy) <= radius_sq
+
+                    if not np.any(valid):
+                        continue
+
+                if plan_iter is not None:
+                    sampled = _sample_linear_plan(
+                        source_pixels,
+                        sample_x0,
+                        sample_x1,
+                        sample_y0,
+                        sample_y1,
+                        fx,
+                        fy,
+                    )
+                else:
+                    coords = source_flat[ids[valid]]
+                    sampled = _sample(
+                        source_pixels,
+                        coords[:, 0] * w - 0.5,
+                        coords[:, 1] * h - 0.5,
+                        settings.interpolation,
+                    )
 
                 if tangent_normal:
                     start_normal = perf_counter()
@@ -133,7 +279,6 @@ def _reproject_image_cpu(image, mapping, settings):
 
                     normal[:, 0] = x
                     normal[:, 1] = y
-
                     normal_length = np.linalg.norm(normal, axis=1)
                     normal /= np.maximum(normal_length[:, None], 1e-8)
 
@@ -146,6 +291,11 @@ def _reproject_image_cpu(image, mapping, settings):
                 output[y0:y1, x0:x1][valid] = sampled
 
         timings["sample"] = perf_counter() - start
+
+        if plan_build_time:
+            timings["plan_build"] = plan_build_time
+
+        timings["sampling_plan"] = plan_status
 
         if tangent_normal:
             timings["normal_transform"] = normal_transform_time
