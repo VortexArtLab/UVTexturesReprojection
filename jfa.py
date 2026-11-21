@@ -1,27 +1,48 @@
 
 import numpy as np
-
 from .constants import TILE_SIZE
 
 
-def _jump_flood_pass(current, target, width, height, step):
+def _jump_flood_pass(
+    current,
+    target,
+    width,
+    height,
+    step,
+    x_coords,
+    y_coords,
+    workspace,
+):
+    work_x, work_y, best_dist, candidate_dist, valid, update = workspace
+
     for y0 in range(0, height, TILE_SIZE):
         y1 = min(y0 + TILE_SIZE, height)
+        tile_height = y1 - y0
+        ys = y_coords[y0:y1, None]
 
         for x0 in range(0, width, TILE_SIZE):
             x1 = min(x0 + TILE_SIZE, width)
+            tile_width = x1 - x0
+            xs = x_coords[None, x0:x1]
 
-            best = current[y0:y1, x0:x1].copy()
-            ys = np.arange(y0, y1, dtype=np.int64)[:, None]
-            xs = np.arange(x0, x1, dtype=np.int64)[None, :]
-            valid = best >= 0
-            seed_x = np.where(valid, best % width, 0).astype(np.int64)
-            seed_y = np.where(valid, best // width, 0).astype(np.int64)
+            best = target[y0:y1, x0:x1]
+            np.copyto(best, current[y0:y1, x0:x1])
 
-            dx = seed_x - xs
-            dy = seed_y - ys
-            best_dist = dx * dx + dy * dy
-            best_dist[~valid] = np.iinfo(np.int64).max
+            wx = work_x[:tile_height, :tile_width]
+            wy = work_y[:tile_height, :tile_width]
+            bd = best_dist[:tile_height, :tile_width]
+            mask = valid[:tile_height, :tile_width]
+
+            np.remainder(best, width, out=wx)
+            np.floor_divide(best, width, out=wy)
+            np.subtract(wx, xs, out=wx)
+            np.square(wx, out=wx)
+            np.subtract(wy, ys, out=wy)
+            np.square(wy, out=wy)
+            np.add(wx, wy, out=bd)
+
+            np.less(best, 0, out=mask)
+            np.copyto(bd, np.iinfo(bd.dtype).max, where=mask)
 
             for oy in (-step, 0, step):
                 ay = max(y0, -oy)
@@ -44,34 +65,88 @@ def _jump_flood_pass(current, target, width, height, step):
                         ay + oy:by + oy,
                         ax + ox:bx + ox,
                     ]
-                    valid = candidates >= 0
 
-                    if not np.any(valid):
+                    candidate_height, candidate_width = candidates.shape
+
+                    wx = work_x[:candidate_height, :candidate_width]
+                    wy = work_y[:candidate_height, :candidate_width]
+                    dist = candidate_dist[:candidate_height, :candidate_width]
+                    mask = valid[:candidate_height, :candidate_width]
+                    update_mask = update[:candidate_height, :candidate_width]
+
+                    np.greater_equal(candidates, 0, out=mask)
+
+                    if not mask.any():
                         continue
 
-                    cx = np.where(valid, candidates % width, 0).astype(np.int64)
-                    cy = np.where(valid, candidates // width, 0).astype(np.int64)
+                    np.remainder(candidates, width, out=wx)
+                    np.floor_divide(candidates, width, out=wy)
 
-                    dx = cx - np.arange(ax, bx, dtype=np.int64)[None, :]
-                    dy = cy - np.arange(ay, by, dtype=np.int64)[:, None]
-                    dist = dx * dx + dy * dy
+                    np.subtract(
+                        wx,
+                        x_coords[None, ax:bx],
+                        out=wx,
+                    )
+                    np.square(wx, out=wx)
+
+                    np.subtract(
+                        wy,
+                        y_coords[ay:by, None],
+                        out=wy,
+                    )
+                    np.square(wy, out=wy)
+
+                    np.add(wx, wy, out=dist)
+
                     sy = slice(ay - y0, by - y0)
                     sx = slice(ax - x0, bx - x0)
 
                     best_sub = best[sy, sx]
-                    dist_sub = best_dist[sy, sx]
-                    update = valid & (dist < dist_sub)
+                    dist_sub = bd[sy, sx]
 
-                    best_sub[update] = candidates[update]
-                    dist_sub[update] = dist[update]
+                    np.less(dist, dist_sub, out=update_mask)
+                    np.logical_and(
+                        update_mask,
+                        mask,
+                        out=update_mask,
+                    )
 
-            target[y0:y1, x0:x1] = best
+                    np.copyto(best_sub, candidates, where=update_mask)
+                    np.copyto(dist_sub, dist, where=update_mask)
 
 
 def jump_flood(seed_map):
     height, width = seed_map.shape
+
+    if seed_map.dtype.kind != "i":
+        raise TypeError("Seed map must use a signed integer dtype")
+
+    max_distance = (width - 1) ** 2 + height ** 2
+
+    use_int32 = (
+        seed_map.dtype.itemsize <= 4
+        and max_distance <= np.iinfo(np.int32).max
+    )
+    dtype = np.int32 if use_int32 else np.int64
+
     current = seed_map
     buffer = np.empty_like(current)
+
+    x_coords = np.arange(width, dtype=dtype)
+    y_coords = np.arange(height, dtype=dtype)
+
+    workspace_shape = (
+        min(TILE_SIZE, height),
+        min(TILE_SIZE, width),
+    )
+
+    workspace = tuple(
+        np.empty(workspace_shape, dtype=dtype)
+        for _ in range(4)
+    ) + tuple(
+        np.empty(workspace_shape, dtype=np.bool_)
+        for _ in range(2)
+    )
 
     step = 1 << max(
         0,
@@ -79,11 +154,29 @@ def jump_flood(seed_map):
     )
 
     while step:
-        _jump_flood_pass(current, buffer, width, height, step)
+        _jump_flood_pass(
+            current,
+            buffer,
+            width,
+            height,
+            step,
+            x_coords,
+            y_coords,
+            workspace,
+        )
         current, buffer = buffer, current
         step //= 2
 
-    _jump_flood_pass(current, buffer, width, height, 1)
+    _jump_flood_pass(
+        current,
+        buffer,
+        width,
+        height,
+        1,
+        x_coords,
+        y_coords,
+        workspace,
+    )
     current, buffer = buffer, current
 
     return current
