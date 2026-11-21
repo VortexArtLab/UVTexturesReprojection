@@ -18,23 +18,29 @@ class ReprojectionMap:
     __slots__ = (
         "width", "height",
         "source_coords", "nearest_map",
+        "tangent_map", "normal_maps",
         "gpu_source_coords", "gpu_nearest_map",
-        "gpu_overlap_flag", "gpu_resources",
-        "gpu_error", "overlap_checked",
+        "gpu_tangent_map", "gpu_overlap_flag",
+        "gpu_resources", "gpu_error", "overlap_checked",
     )
 
-    def __init__(self, width, height, source_coords, nearest_map):
+    def __init__(
+        self, width, height, source_coords, nearest_map,
+        tangent_map=None, normal_maps=None,
+    ):
         self.width = width
         self.height = height
         self.source_coords = source_coords
         self.nearest_map = nearest_map
+        self.tangent_map = tangent_map
+        self.normal_maps = normal_maps or {}
         self.gpu_source_coords = None
         self.gpu_nearest_map = None
+        self.gpu_tangent_map = None
         self.gpu_overlap_flag = None
         self.gpu_resources = []
         self.gpu_error = ""
         self.overlap_checked = False
-
 
 def ensure_cpu_mapping(mapping, settings):
     start = perf_counter()
@@ -122,6 +128,415 @@ def iter_material_node_trees(obj):
                 stack.append(node.node_tree)
 
 
+def _match_socket(sockets, reference):
+    identifier = getattr(reference, "identifier", "")
+    if identifier:
+        for socket in sockets:
+            if socket.identifier == identifier:
+                return socket
+    return next(
+        (socket for socket in sockets if socket.name == reference.name),
+        None,
+    )
+
+
+def _find_upstream_images(socket, group_stack, visited):
+    found = {}
+    context = tuple(node.as_pointer() for node in group_stack)
+    key = (socket.as_pointer(), context)
+
+    if key in visited:
+        return found
+    visited.add(key)
+
+    for link in socket.links:
+        node = link.from_node
+
+        if node.type == 'TEX_IMAGE':
+            if link.from_socket.name == "Color" and node.image:
+                found[node.image.as_pointer()] = node
+
+        elif node.type == 'REROUTE':
+            found.update(_find_upstream_images(
+                node.inputs[0], group_stack, visited
+            ))
+
+        elif node.type == 'GROUP':
+            tree = node.node_tree
+            if not tree:
+                continue
+
+            outputs = [
+                item for item in tree.nodes
+                if item.type == 'GROUP_OUTPUT'
+            ]
+            output_node = next(
+                (item for item in outputs if item.is_active_output),
+                outputs[0] if outputs else None,
+            )
+
+            if output_node:
+                output = _match_socket(
+                    output_node.inputs, link.from_socket
+                )
+                if output:
+                    found.update(_find_upstream_images(
+                        output, group_stack + (node,), visited
+                    ))
+
+        elif node.type == 'GROUP_INPUT':
+            if not group_stack:
+                continue
+
+            instance = group_stack[-1]
+            parent_input = _match_socket(
+                instance.inputs, link.from_socket
+            )
+            if parent_input:
+                found.update(_find_upstream_images(
+                    parent_input, group_stack[:-1], visited
+                ))
+
+        else:
+            for input_socket in node.inputs:
+                if (
+                    input_socket.is_linked
+                    and input_socket.type in {'RGBA', 'VECTOR'}
+                ):
+                    found.update(_find_upstream_images(
+                        input_socket, group_stack, visited
+                    ))
+
+    return found
+
+
+def collect_normal_map_images(obj, selected_images=None):
+    selected = None
+    if selected_images is not None:
+        selected = {
+            image.as_pointer()
+            for image in selected_images
+            if image is not None
+        }
+
+    found = {}
+
+    def visit(tree, group_stack, ancestry):
+        if not tree:
+            return
+
+        pointer = tree.as_pointer()
+        if pointer in ancestry:
+            return
+        ancestry = ancestry | {pointer}
+
+        for node in tree.nodes:
+            if node.bl_idname == 'ShaderNodeNormalMap':
+                color = node.inputs.get("Color")
+                if color and color.is_linked:
+                    images = _find_upstream_images(
+                        color, group_stack, set()
+                    )
+
+                    active_uv = (
+                        obj.data.uv_layers.active_render
+                        or obj.data.uv_layers.active
+                    )
+                    uv_map = node.uv_map or (
+                        active_uv.name if active_uv else ""
+                    )
+
+                    usage = (
+                        node.space,
+                        node.convention if node.space == 'TANGENT' else None,
+                        uv_map if node.space == 'TANGENT' else None,
+                    )
+
+                    for image_node in images.values():
+                        image = image_node.image
+                        image_pointer = image.as_pointer()
+
+                        if selected is not None and image_pointer not in selected:
+                            continue
+
+                        entry = found.setdefault(image_pointer, {
+                            "image": image,
+                            "uses": [],
+                            "nodes": [],
+                            "node_pointers": set(),
+                        })
+
+                        entry["uses"].append(usage)
+
+                        node_pointer = node.as_pointer()
+                        if node_pointer not in entry["node_pointers"]:
+                            entry["node_pointers"].add(node_pointer)
+                            entry["nodes"].append(node)
+
+            if node.type == 'GROUP' and node.node_tree:
+                visit(
+                    node.node_tree,
+                    group_stack + (node,),
+                    ancestry,
+                )
+
+    for slot in obj.material_slots:
+        material = slot.material
+        if material and material.use_nodes:
+            visit(material.node_tree, (), frozenset())
+
+    for entry in found.values():
+        uses = set(entry["uses"])
+
+        if len(uses) != 1:
+            raise ReprojectionError(
+                f"Image '{entry['image'].name}' is used by "
+                "incompatible Normal Map nodes"
+            )
+
+        space, convention, uv_map = next(iter(uses))
+
+        entry["space"] = space
+        entry["convention"] = convention
+        entry["uv_map"] = uv_map
+
+        del entry["uses"]
+        del entry["node_pointers"]
+
+    return found
+
+
+def _calc_loop_tangents(mesh, uv_name):
+    calculated = False
+
+    try:
+        mesh.calc_tangents(uvmap=uv_name)
+        calculated = True
+
+        loop_count = len(mesh.loops)
+        tangents = np.empty(loop_count * 3, dtype=np.float32)
+        normals = np.empty(loop_count * 3, dtype=np.float32)
+        signs = np.empty(loop_count, dtype=np.float32)
+
+        mesh.loops.foreach_get("tangent", tangents)
+        mesh.loops.foreach_get("normal", normals)
+        mesh.loops.foreach_get("bitangent_sign", signs)
+
+        return (
+            tangents.reshape(-1, 3),
+            normals.reshape(-1, 3),
+            signs,
+        )
+
+    except Exception as exc:
+        raise ReprojectionError(
+            f"Cannot calculate tangents for UV map '{uv_name}': {exc}"
+        ) from exc
+
+    finally:
+        if calculated:
+            mesh.free_tangents()
+
+
+def _build_tangent_transforms(mesh, loop_indices, source_uv, destination_uv):
+    source_tangent, normals, source_sign = _calc_loop_tangents(
+        mesh, source_uv
+    )
+    destination_tangent, _, destination_sign = _calc_loop_tangents(
+        mesh, destination_uv
+    )
+
+    normal_length = np.linalg.norm(normals, axis=1)
+    source_length = np.linalg.norm(source_tangent, axis=1)
+    destination_length = np.linalg.norm(destination_tangent, axis=1)
+
+    if (
+        np.any(normal_length < 1e-6)
+        or np.any(source_length < 1e-6)
+        or np.any(destination_length < 1e-6)
+    ):
+        raise ReprojectionError(
+            "Cannot build tangent transforms: degenerate tangent basis"
+        )
+
+    normals /= normal_length[:, None]
+
+    source_tangent -= (
+        normals * np.sum(source_tangent * normals, axis=1)[:, None]
+    )
+    destination_tangent -= (
+        normals * np.sum(destination_tangent * normals, axis=1)[:, None]
+    )
+
+    source_tangent /= np.maximum(
+        np.linalg.norm(source_tangent, axis=1)[:, None], 1e-8
+    )
+    destination_tangent /= np.maximum(
+        np.linalg.norm(destination_tangent, axis=1)[:, None], 1e-8
+    )
+
+    source_sign = np.where(source_sign < 0.0, -1.0, 1.0)
+    destination_sign = np.where(destination_sign < 0.0, -1.0, 1.0)
+
+    source_bitangent = (
+        np.cross(normals, source_tangent) * source_sign[:, None]
+    )
+    destination_bitangent = (
+        np.cross(normals, destination_tangent)
+        * destination_sign[:, None]
+    )
+
+    transforms = np.empty((len(mesh.loops), 4), dtype=np.float32)
+
+    transforms[:, 0] = np.sum(
+        destination_tangent * source_tangent, axis=1
+    )
+    transforms[:, 1] = np.sum(
+        destination_tangent * source_bitangent, axis=1
+    )
+    transforms[:, 2] = np.sum(
+        destination_bitangent * source_tangent, axis=1
+    )
+    transforms[:, 3] = np.sum(
+        destination_bitangent * source_bitangent, axis=1
+    )
+
+    determinant = (
+        transforms[:, 0] * transforms[:, 3]
+        - transforms[:, 1] * transforms[:, 2]
+    )
+
+    if np.any(np.abs(determinant) < 0.5):
+        raise ReprojectionError(
+            "Invalid source/destination tangent transformation"
+        )
+
+    return np.ascontiguousarray(transforms[loop_indices])
+
+
+def _iter_material_nodes(obj):
+    def visit(tree, group_stack, ancestry):
+        pointer = tree.as_pointer()
+        if pointer in ancestry:
+            return
+
+        ancestry = ancestry | {pointer}
+
+        for node in tree.nodes:
+            yield tree, node, group_stack
+
+            if node.type == 'GROUP' and node.node_tree:
+                yield from visit(
+                    node.node_tree,
+                    group_stack + (node,),
+                    ancestry,
+                )
+
+    seen = set()
+
+    for slot in obj.material_slots:
+        material = slot.material
+        if not material or not material.use_nodes or not material.node_tree:
+            continue
+
+        pointer = material.node_tree.as_pointer()
+        if pointer in seen:
+            continue
+
+        seen.add(pointer)
+        yield from visit(material.node_tree, (), frozenset())
+
+
+def _find_upstream_images(socket, group_stack, visited):
+    images = {}
+    context = tuple(node.as_pointer() for node in group_stack)
+    key = (socket.as_pointer(), context)
+
+    if key in visited:
+        return images
+
+    visited.add(key)
+
+    def add(found):
+        images.update(found)
+
+    for link in socket.links:
+        node = link.from_node
+
+        if node.type == 'TEX_IMAGE':
+            if node.image:
+                images[node.image.as_pointer()] = node
+
+        elif node.type == 'REROUTE':
+            add(_find_upstream_images(
+                node.inputs[0],
+                group_stack,
+                visited,
+            ))
+
+        elif node.type == 'GROUP':
+            tree = node.node_tree
+            if not tree:
+                continue
+
+            outputs = [
+                item for item in tree.nodes
+                if item.type == 'GROUP_OUTPUT'
+            ]
+            output_node = next(
+                (item for item in outputs if item.is_active_output),
+                outputs[0] if outputs else None,
+            )
+
+            if output_node is None:
+                continue
+
+            output = output_node.inputs.get(link.from_socket.identifier)
+            if output is None:
+                output = output_node.inputs.get(link.from_socket.name)
+
+            if output is not None:
+                add(_find_upstream_images(
+                    output,
+                    group_stack + (node,),
+                    visited,
+                ))
+
+        elif node.type == 'GROUP_INPUT':
+            if not group_stack:
+                continue
+
+            group_instance = group_stack[-1]
+            input_socket = group_instance.inputs.get(
+                link.from_socket.identifier
+            )
+            if input_socket is None:
+                input_socket = group_instance.inputs.get(
+                    link.from_socket.name
+                )
+
+            if input_socket is not None:
+                add(_find_upstream_images(
+                    input_socket,
+                    group_stack[:-1],
+                    visited,
+                ))
+
+        else:
+            for input_socket in node.inputs:
+                if (
+                    input_socket.is_linked
+                    and input_socket.type in {'RGBA', 'VECTOR'}
+                ):
+                    add(_find_upstream_images(
+                        input_socket,
+                        group_stack,
+                        visited,
+                    ))
+
+    return images
+
+
 def find_reprojected_image(image, suffix):
     matches = [
         candidate for candidate in bpy.data.images
@@ -141,6 +556,7 @@ def update_materials(obj, settings):
     if settings.destination_uv not in uv_names:
         raise ReprojectionError("Invalid destination UV map")
 
+    normal_maps = collect_normal_map_images(obj)
     replacements = {}
     missing = []
 
@@ -241,6 +657,21 @@ def update_materials(obj, settings):
 
         updated_nodes += len(targets)
 
+    updated_normal_nodes = set()
+    for pointer, entry in normal_maps.items():
+        if pointer not in replacements:
+            continue
+        if entry["space"] != 'TANGENT':
+            continue
+
+        for node in entry["nodes"]:
+            node_pointer = node.as_pointer()
+            if node_pointer in updated_normal_nodes:
+                continue
+
+            node.uv_map = settings.destination_uv
+            updated_normal_nodes.add(node_pointer)
+
     return updated_nodes, missing
 
 
@@ -326,13 +757,53 @@ def build_uv_triangles(obj):
     ):
         if not np.all(np.isfinite(uv)):
             raise ReprojectionError(f"{name} UV coordinates contain invalid values")
-
         if np.any(uv < -1e-6) or np.any(uv > 1.000001):
             raise ReprojectionError(f"{name} UV coordinates outside 0-1 are unsupported")
-
         np.clip(uv, 0.0, 1.0, out=uv)
 
-    return source_triangles, destination_triangles
+    selected_images = [
+        item.image for item in settings.textures if item.image
+    ]
+    normal_maps = collect_normal_map_images(obj, selected_images)
+
+    tangent_maps = [
+        entry for entry in normal_maps.values()
+        if entry["space"] == 'TANGENT'
+    ]
+    for entry in tangent_maps:
+        if not entry["image"].colorspace_settings.is_data:
+            raise ReprojectionError(
+                f"Normal map must use Non-Color: {entry['image'].name}"
+            )
+
+    tangent_triangles = None
+
+    if tangent_maps:
+        invalid_uvs = {
+            entry["uv_map"]
+            for entry in tangent_maps
+            if entry["uv_map"] != settings.source_uv
+        }
+
+        if invalid_uvs:
+            raise ReprojectionError(
+                "Normal Map nodes use UV maps different from Source UV: "
+                + ", ".join(sorted(invalid_uvs))
+            )
+
+        tangent_triangles = _build_tangent_transforms(
+            mesh,
+            loop_indices,
+            settings.source_uv,
+            settings.destination_uv,
+        )
+
+    return (
+        source_triangles,
+        destination_triangles,
+        tangent_triangles,
+        normal_maps,
+    )
 
 
 def _sample(pixels, x, y, mode):
@@ -387,7 +858,10 @@ def _top_left(a, b):
     return dy > 0.0 or (abs(dy) < 1e-12 and dx < 0.0)
 
 
-def _rasterize_triangle(source_coords, seed_map, src, dst, settings):
+def _rasterize_triangle(
+    source_coords, seed_map, src, dst, settings,
+    tangent_map=None, tangent_triangle=None,
+):
     h, w = seed_map.shape
     dst = dst * np.array((w, h), dtype=np.float32)
 
@@ -401,6 +875,8 @@ def _rasterize_triangle(source_coords, seed_map, src, dst, settings):
     if area < 0.0:
         dst = dst[[0, 2, 1]]
         src = src[[0, 2, 1]]
+        if tangent_triangle is not None:
+            tangent_triangle = tangent_triangle[[0, 2, 1]]
         area = -area
 
     x0 = max(0, int(np.ceil(dst[:, 0].min() - 0.5)))
@@ -457,7 +933,35 @@ def _rasterize_triangle(source_coords, seed_map, src, dst, settings):
             )
 
             source_coords[ty:ty1, tx:tx1][inside] = uv
-            seeds[inside] = (yy[inside] * w + xx[inside])
+            seeds[inside] = yy[inside] * w + xx[inside]
+
+            if tangent_map is not None:
+                matrices = (
+                    w0[:, None] * tangent_triangle[0]
+                    + w1[:, None] * tangent_triangle[1]
+                    + w2[:, None] * tangent_triangle[2]
+                )
+
+                axis_x = np.stack(
+                    (matrices[:, 0], matrices[:, 2]), axis=1
+                )
+                axis_length = np.linalg.norm(axis_x, axis=1)
+
+                determinant = (
+                    matrices[:, 0] * matrices[:, 3]
+                    - matrices[:, 1] * matrices[:, 2]
+                )
+
+                handedness = np.where(determinant < 0.0, -1.0, 1.0)
+                axis_x /= np.maximum(axis_length[:, None], 1e-8)
+
+                orthogonal = np.empty_like(matrices)
+                orthogonal[:, 0] = axis_x[:, 0]
+                orthogonal[:, 1] = -axis_x[:, 1] * handedness
+                orthogonal[:, 2] = axis_x[:, 1]
+                orthogonal[:, 3] = axis_x[:, 0] * handedness
+
+                tangent_map[ty:ty1, tx:tx1][inside] = orthogonal
 
 
 def check_gpu_overlap(mapping, settings):
@@ -487,6 +991,23 @@ def build_reprojection_map(triangles, width, height, settings):
     if width * height > np.iinfo(np.int32).max:
         raise ReprojectionError("Image resolution exceeds supported limits")
 
+    (
+        source_triangles,
+        destination_triangles,
+        tangent_triangles,
+        normal_maps,
+    ) = triangles
+
+    has_tangent_maps = tangent_triangles is not None
+
+    if has_tangent_maps and settings.compute_backend == 'GPU':
+        raise ReprojectionError(
+            "Tangent-space normal maps are temporarily supported "
+            "only by the CPU backend"
+        )
+
+    use_gpu = settings.compute_backend != 'CPU' and not has_tangent_maps
+
     gpu_source_coords = None
     gpu_seed_map = None
     gpu_overlap_flag = None
@@ -494,10 +1015,15 @@ def build_reprojection_map(triangles, width, height, settings):
     jfa_resources = []
     gpu_errors = []
 
+    if has_tangent_maps and settings.compute_backend == 'AUTO':
+        gpu_errors.append(
+            "Tangent-space normal maps require CPU processing"
+        )
+
     raster_backend = "CPU"
     raster_details = {}
 
-    if settings.compute_backend != 'CPU':
+    if use_gpu:
         try:
             (
                 gpu_source_coords,
@@ -519,6 +1045,7 @@ def build_reprojection_map(triangles, width, height, settings):
 
     source_coords = None
     seed_map = None
+    tangent_map = None
     raster_time = 0.0
 
     if gpu_source_coords is None:
@@ -529,8 +1056,12 @@ def build_reprojection_map(triangles, width, height, settings):
             (height, width), -1, dtype=np.int32
         )
 
+        if has_tangent_maps:
+            tangent_map = np.zeros(
+                (height, width, 4), dtype=np.float32
+            )
+
         start = perf_counter()
-        source_triangles, destination_triangles = triangles
 
         for index in range(len(source_triangles)):
             _rasterize_triangle(
@@ -539,7 +1070,10 @@ def build_reprojection_map(triangles, width, height, settings):
                 source_triangles[index],
                 destination_triangles[index],
                 settings,
+                tangent_map,
+                tangent_triangles[index] if has_tangent_maps else None,
             )
+
         raster_time = perf_counter() - start
 
         if not np.any(seed_map >= 0):
@@ -570,10 +1104,12 @@ def build_reprojection_map(triangles, width, height, settings):
 
             nearest_map = _jump_flood(seed_data)
             gpu_nearest_map = None
-            raster_resources = ([gpu_overlap_flag] if gpu_overlap_flag is not None else [])
+            raster_resources = (
+                [gpu_overlap_flag] if gpu_overlap_flag is not None else []
+            )
             gpu_errors.append(f"JFA: {exc}")
 
-    elif settings.compute_backend != 'CPU':
+    elif use_gpu:
         try:
             gpu_nearest_map, jfa_resources = gpu_backend.jump_flood(
                 seed_map, width, height
@@ -583,7 +1119,6 @@ def build_reprojection_map(triangles, width, height, settings):
         except Exception as exc:
             if settings.compute_backend == 'GPU':
                 raise ReprojectionError(f"GPU JFA failed: {exc}") from exc
-
             nearest_map = _jump_flood(seed_map)
             gpu_errors.append(f"JFA: {exc}")
 
@@ -593,7 +1128,12 @@ def build_reprojection_map(triangles, width, height, settings):
     jfa_time = perf_counter() - start
 
     mapping = ReprojectionMap(
-        width, height, source_coords, nearest_map
+        width,
+        height,
+        source_coords,
+        nearest_map,
+        tangent_map,
+        normal_maps,
     )
 
     mapping.gpu_source_coords = gpu_source_coords
@@ -601,9 +1141,8 @@ def build_reprojection_map(triangles, width, height, settings):
     mapping.gpu_overlap_flag = gpu_overlap_flag
     mapping.gpu_resources = raster_resources + jfa_resources
 
-    if settings.compute_backend != 'CPU':
+    if use_gpu:
         start = perf_counter()
-
         try:
             gpu_backend.create_sampling_maps(mapping)
 
@@ -621,7 +1160,6 @@ def build_reprojection_map(triangles, width, height, settings):
     mapping.gpu_error = "; ".join(gpu_errors)
 
     raster_total = sum(raster_details.values())
-
     timings = {
         "raster": raster_total,
         "raster_backend": raster_backend,
@@ -727,6 +1265,15 @@ def _jump_flood(seed_map):
 def _reproject_image_cpu(image, mapping, settings):
     timings = {}
     w, h = mapping.width, mapping.height
+    normal_info = mapping.normal_maps.get(image.as_pointer())
+    tangent_normal = bool(
+        normal_info and normal_info["space"] == 'TANGENT'
+    )
+
+    if tangent_normal and mapping.tangent_map is None:
+        raise ReprojectionError(
+            f"Tangent map unavailable for image: {image.name}"
+        )
 
     if tuple(image.size) != (w, h):
         raise ReprojectionError(f"Resolution mismatch: {image.name}")
@@ -743,6 +1290,11 @@ def _reproject_image_cpu(image, mapping, settings):
         start = perf_counter()
         output = np.zeros((h, w, 4), dtype=np.float32)
         source_flat = mapping.source_coords.reshape(-1, 2)
+        tangent_flat = (
+            mapping.tangent_map.reshape(-1, 4)
+            if tangent_normal else None
+        )
+        normal_transform_time = 0.0
         radius_sq = settings.padding ** 2
 
         for y0 in range(0, h, TILE_SIZE):
@@ -770,10 +1322,41 @@ def _reproject_image_cpu(image, mapping, settings):
                     coords[:, 0] * w - 0.5,
                     coords[:, 1] * h - 0.5,
                     settings.interpolation,
-                )
+                ).copy()
+
+                if tangent_normal:
+                    start_normal = perf_counter()
+
+                    matrix = tangent_flat[ids[valid]]
+                    normal = sampled[:, :3] * 2.0 - 1.0
+
+                    directx = normal_info["convention"] == 'DIRECTX'
+
+                    if directx:
+                        normal[:, 1] *= -1.0
+
+                    x = matrix[:, 0] * normal[:, 0] + matrix[:, 1] * normal[:, 1]
+                    y = matrix[:, 2] * normal[:, 0] + matrix[:, 3] * normal[:, 1]
+
+                    normal[:, 0] = x
+                    normal[:, 1] = y
+
+                    normal_length = np.linalg.norm(normal, axis=1)
+                    normal /= np.maximum(normal_length[:, None], 1e-8)
+
+                    if directx:
+                        normal[:, 1] *= -1.0
+
+                    sampled[:, :3] = normal * 0.5 + 0.5
+
+                    normal_transform_time += perf_counter() - start_normal
+
                 output[y0:y1, x0:x1][valid] = sampled
 
         timings["sample"] = perf_counter() - start
+        
+        if tangent_normal:
+            timings["normal_transform"] = normal_transform_time
 
         start = perf_counter()
         result = bpy.data.images.new(

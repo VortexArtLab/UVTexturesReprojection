@@ -95,7 +95,7 @@ def rasterize(triangles, width, height, settings):
 
 
 def _build_tile_bins(triangles, width, height):
-    source_triangles, destination_triangles = triangles
+    source_triangles, destination_triangles = triangles[:2]
     triangle_count = len(source_triangles)
 
     tiles_x = (width + TILE_SIZE - 1) // TILE_SIZE
